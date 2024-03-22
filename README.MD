@@ -4,7 +4,7 @@
 * Toolchain: Keil uVision/MDK
 * Target: STM32F103TB (CM3, 128K Flash, 20K RAM)
 * Hardware: STM32F103 Blue Pull
-* Repository: [github.com/tomcircuit/STM32F103_UNIO](https://github.com/tomcircuit/STM32F_UNIO)
+* Repository: [github.com/tomcircuit/STM32F103_UNIO](https://github.com/tomcircuit/STM32F103_UNIO)
 
 ## Description
 
