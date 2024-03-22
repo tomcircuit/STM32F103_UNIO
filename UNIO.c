@@ -1,5 +1,6 @@
 /* Copyright (C) 2011 by Stephen Early <steve@greenend.org.uk>
 Copyright (C) 2017 by Jeroen Lanting <https://github.com/NESFreak>
+Copyright (C) 2024 by Tom Lemense <https://github.com/tomcircuit>
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
@@ -20,44 +21,109 @@ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 
+/* STM32F103 implementation notes:
+
+I chose to configure the UNI/O bus GPIO as Open Drain. This allows
+the pin to be read/written without having to change pin direction.
+
+The MSP430 driver used software timed loops for bit timing. I chose
+to use TIM3, one of the General Purpose Timers in a polled fashion.
+I did not bother to disable interrupts because the STM32F103 is
+normally running quite a bit faster than the bit timing, so any well-
+behaved ISR should not affect the timing very much. YMMV.
+
+With 24MHz sysclk, there is a fair amount of overhead in the bit
+functions. The target bit timing is 32us per bit, but in my testing
+this was closer to 36us/bit. Because the 11AAxxx EEPROM bit timing
+accuracy is non-critical, I did not bother to optimize this. From
+my observations, the timing stability is sufficient.
+
+I did change the function names, in an effort to make it more
+apparent what they do. For example, the functions that transmit
+to the UNI/O device have "send" in the name, and the functions that
+receive from the device have "receive" in the name. I followed suit
+for the "send_byte" and "send_n_bytes" functions, again for clarity.
+The words "read" and "write" are reserved for the EEPROM high level
+operations with the same names. I did not rename the hgher-level
+level EEPROM access functions, to ease porting.
+
+I exposed the SETAL and ERAL commands to allow bulk set and builk
+erase of the EEPROM bits. These require a separate UNIO_enable_write()
+call immediately beforehand.
+
+*/
+
 #include "UNIO.h"
 
-#define UNIO_STARTHEADER 0x55
-#define UNIO_READ        0x03
-#define UNIO_CRRD        0x06
-#define UNIO_WRITE       0x6c
-#define UNIO_WREN        0x96
-#define UNIO_WRDI        0x91
-#define UNIO_RDSR        0x05
-#define UNIO_WRSR        0x6e
-#define UNIO_ERAL        0x6d
-#define UNIO_SETAL       0x67
+#include "stm32f10x.h"
 
-// The following are defined in the datasheet as _minimum_ times, in
-// microseconds.  There is no maximum.
-#define UNIO_TSTBY 600
-#define UNIO_TSS    10
-#define UNIO_THDR    5
-
-#define UNIO_QUARTER_BIT 10
-
-// Add this to all the times defined above, to be on the safe side!
-#define UNIO_FUDGE_FACTOR 5
-
-#define UNIO_OUTPUT() do { UNIO_PXDIR |= (0b1 << UNIO_PIN); } while (0)
-#define UNIO_INPUT() do { UNIO_PXDIR &= ~(0b1 << UNIO_PIN); } while (0)
-
-#define delayMicroseconds(us) do { __delay_cycles((us)*UNIO_USCLKS); } while (0)
-
-static void set_bus(bool state)
+/* GPT polled microsecond delay function */
+static void inline delayMicroseconds(uint16_t us)
 {
-  UNIO_PXOUT = (UNIO_PXOUT & ~(0b1 << UNIO_PIN)) | (!!state)<<UNIO_PIN;
+    /* load the reload-register with target tick value */
+    //TIM3->ARR = (us);
+    GPT_RELOAD(us);
+
+    /* force update of the PSC and ARR */
+    //TIM3->EGR |= TIM_EGR_UG;
+    GPT_UPDATE;
+
+    /* start the timer */
+    //TIM3->CR1  |= TIM_CR1_CEN;
+    GPT_START;
+
+    /* wait for timer to expire */
+    while (GPT_RUNNING)
+        __NOP();
+}
+
+/* GPT polled transition hunt function - returns true if transition found */
+static bool inline huntMicroseconds(uint16_t us)
+{
+    bool state;
+
+    /* release bus to pullup */
+    UNIO_HIGH;
+
+    /* load the reload-register with target tick value */
+    //TIM3->ARR = (us);
+    GPT_RELOAD(us);
+
+    /* force update of the PSC and ARR */
+    //TIM3->EGR |= TIM_EGR_UG;
+    GPT_UPDATE;
+
+    /* start the timer */
+    //TIM3->CR1  |= TIM_CR1_CEN;
+    GPT_START;
+
+    /* capture the input state */
+    state = !!(UNIO_INP);
+
+    /* wait for timer to expire OR the state to change */
+    while (GPT_RUNNING && (state == !!(UNIO_INP)))
+        __NOP();
+
+    /* stop the timer */
+    //TIM3->CR1  &= ~TIM_CR1_CEN;
+    GPT_STOP;
+
+    /* return true if state changed */
+    return (state == !(UNIO_INP));
 }
 
 
-static inline bool read_bus(void)
+void unio_set_bus(bool state)
 {
-  return !!(UNIO_PXIN & (0b1 << UNIO_PIN));
+    if (state)
+        UNIO_HIGH;
+    else
+        UNIO_LOW;
+}
+
+bool unio_read_bus(void)
+{
+    return !!(UNIO_INP);
 }
 
 /* If multiple commands are to be issued to a device without a standby
@@ -65,8 +131,8 @@ static inline bool read_bus(void)
    between the end of one command and the start of the next. */
 static void unio_inter_command_gap(void)
 {
-  set_bus(1);
-  delayMicroseconds(UNIO_TSS+UNIO_FUDGE_FACTOR);
+    UNIO_HIGH;
+    delayMicroseconds(UNIO_TSS_US + UNIO_MARGIN_US);
 }
 
 /* Send a standby pulse on the bus.  After power-on or brown-out
@@ -75,89 +141,117 @@ static void unio_inter_command_gap(void)
    bus low for UNIO_TSS, then high for UNIO_TSTBY. */
 static void unio_standby_pulse(void)
 {
-  set_bus(0);
-  UNIO_OUTPUT();
-  delayMicroseconds(UNIO_TSS+UNIO_FUDGE_FACTOR);
-  set_bus(1);
-  delayMicroseconds(UNIO_TSTBY+UNIO_FUDGE_FACTOR);
+    UNIO_LOW;
+    delayMicroseconds(UNIO_TSS_US + UNIO_MARGIN_US);
+    UNIO_HIGH;
+    delayMicroseconds(UNIO_TSTBY_US + UNIO_MARGIN_US);
 }
 
-/* While bit-banging, all delays are expressed in terms of quarter
-   bits.  We use the same code path for reading and writing.  During a
-   write, we perform dummy reads at 1/4 and 3/4 of the way through
-   each bit time.  During a read we perform a dummy write at the start
-   and 1/2 way through each bit time. */
+/* While bit-banging, all delays are expressed in terms of UNIO_BIT_US.
+     By using a hardware General Purpose timer, this code is not NEARLY
+   as critial as it would be if software loops were used. */
 
-static bool rwbit(bool w)
+static void unio_send_bit(bool w)
 {
-  bool a,b;
-  set_bus(!w);
-  delayMicroseconds(UNIO_QUARTER_BIT);
-  a=read_bus();
-  delayMicroseconds(UNIO_QUARTER_BIT);
-  set_bus(w);
-  delayMicroseconds(UNIO_QUARTER_BIT);
-  b=read_bus();
-  delayMicroseconds(UNIO_QUARTER_BIT);
-  return b&&!a;
+    bool a;
+    /* set bus to complement of bit to be sent */
+    unio_set_bus(!w);
+    /* delay for 1/4 bit time and then do dummy read */
+    delayMicroseconds(UNIO_QUARTER_BIT_US);
+    a = unio_read_bus();
+    /* delay for 1/4 bit time and invert bus */
+    delayMicroseconds(UNIO_QUARTER_BIT_US);
+    unio_set_bus(w);
+    /* delay for 1/4 bit time and then do dummy read */
+    delayMicroseconds(UNIO_QUARTER_BIT_US);
+    /* delay 1/4 bit time */
+    delayMicroseconds(UNIO_QUARTER_BIT_US);
+
 }
 
-static bool read_bit(void)
+/* receive a bit, sampling bus at 1/4 bit and then polling for transition for 1/2 bit time.
+   This re-syncs our driver with the device during each bit receive interval. Returns 0
+   if not transition found during the bit cell. An extreme  */
+bool unio_receive_bit(void)
 {
-  bool b;
-  UNIO_INPUT();
-  b=rwbit(1);
-  UNIO_OUTPUT();
-  return b;
-}
+    bool a, b;
+    /* release bus to pullup to let device control state */
+    unio_set_bus(1);
+    /* delay for 1/4 bit then sample the bus */
+    delayMicroseconds(UNIO_QUARTER_BIT_US);
+    a = unio_read_bus();
 
-static bool send_uint8_t(uint8_t b, bool mak)
+    /* poll for up to 1/2 bit for a bus transition */
+    b = huntMicroseconds(UNIO_HALF_BIT_US);
+
+    /* if transition detected, delay for remaining 1/2 bit */
+    if (b)
+        delayMicroseconds(UNIO_HALF_BIT_US);
+    /* if no transition found, delay for remaining 1/4 bit */
+    else
+        delayMicroseconds(UNIO_QUARTER_BIT_US);
+    return b && !a;
+}
+/* Send a single byte terminated by MAK/NoMAK. Return SAK/NoSAK status */
+static bool unio_send_byte(uint8_t b, bool mak)
 {
-  for (int i=0; i<8; i++)
+    for (int i = 0; i < 8; i++)
     {
-      rwbit(b&0x80);
-      b<<=1;
+        unio_send_bit(b & 0x80);
+        b <<= 1;
     }
-  rwbit(mak);
-  return read_bit();
+    unio_send_bit(mak);           // transmite MAK/NoMAK
+
+    return unio_receive_bit();    // return SAK/NoSAK status
 }
 
-static bool read_uint8_t(uint8_t *b, bool mak)
+/* Receive a single byte terminated by MAK/NoMAK. Return SAK/NoSAK status */
+static bool unio_receive_byte(uint8_t* b, bool mak)
 {
-  uint8_t data=0;
-  UNIO_INPUT();
-  for (int i=0; i<8; i++)
+    uint8_t data = 0;
+    for (int i = 0; i < 8; i++)
     {
-      data = (data << 1) | rwbit(1);
+        data = (data << 1) | unio_receive_bit();
     }
-  UNIO_OUTPUT();
-  *b=data;
-  rwbit(mak);
-  return read_bit();
+    *b = data;
+    unio_send_bit(mak);           // issue MAK/NoMAK
+
+    return unio_receive_bit();    // return SAK/NoSAK status
 }
 
-/* Send data on the bus. If end is true, send NoMAK after the last
-   uint8_t; otherwise send MAK. */
-static bool unio_send(const uint8_t *data,uint16_t length,bool end)
+/* Send multiple byte data on the bus. If end is true, send NoMAK after the last
+   byte; otherwise send MAK. */
+static bool unio_send_n_bytes(const uint8_t* data, uint16_t length, bool end)
 {
-  for (uint16_t i=0; i<length; i++)
+    for (uint16_t i = 0; i < length; i++)
     {
-      /* Rules for sending MAK: if it's the last uint8_t and end is true,
-         send NoMAK.  Otherwise send MAK. */
-      if (!send_uint8_t(data[i],!(((i+1)==length) && end))) return false;
+        /* Rules for sending MAK: if it's the last byte and end is true,
+           send NoMAK.  Otherwise send MAK. */
+        if (!unio_send_byte(data[i], !(((i + 1) == length) && end)))
+            return false;
     }
-  return true;
+    return true;
 }
 
-/* Read data from the bus.  After reading 'length' uint8_ts, send NoMAK to
-   terminate the command. */
-static bool unio_read(uint8_t *data,uint16_t length)
+/* Read multiple byte data from the bus.  After reading 'length' bytes,
+   send NoMAK to terminate the command. */
+static bool unio_receive_n_bytes(uint8_t* data, uint16_t length)
 {
-  for (uint16_t i=0; i<length; i++)
+    for (uint16_t i = 0; i < length; i++)
     {
-      if (!read_uint8_t(data+i,!((i+1)==length))) return false;
+        if (!unio_receive_byte(data + i, !((i + 1) == length)))
+            return false;
     }
-  return true;
+    return true;
+}
+
+/* Put the UNIO bus to sleep. This does NOT init the MCU GPT and GPIO
+   resources! That must be done elsewhere. */
+void UNIO_init()
+{
+    GPT_STOP;
+    GPT_UPDATE;
+    unio_standby_pulse();
 }
 
 /* Send a start header on the bus.  Hold the bus low for UNIO_THDR,
@@ -167,174 +261,161 @@ static bool unio_read(uint8_t *data,uint16_t length)
    connected then that could cause bus contention. */
 static void unio_start_header(void)
 {
-  set_bus(0);
-  delayMicroseconds(UNIO_THDR+UNIO_FUDGE_FACTOR);
-  send_uint8_t(UNIO_STARTHEADER,true);
+    UNIO_LOW;
+    delayMicroseconds(UNIO_THDR_US + UNIO_MARGIN_US);
+    UNIO_HIGH;
+    unio_send_byte(UNIO_STARTHEADER, true);
 }
 
-void UNIO_init()
+bool UNIO_read(uint8_t dev_address, uint8_t* buffer, uint16_t mem_address, uint16_t length)
 {
-  UNIO_PXDIR    |= (1 << UNIO_PIN);
-  UNIO_PXOUT    |= (1 << UNIO_PIN);
-  UNIO_PXSEL    &= ~(1 << UNIO_PIN);
-  UNIO_PXSEL2   &= ~(1 << UNIO_PIN);
+    bool a, b;
+    uint8_t cmd[4];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_READ;
+    cmd[2] = (uint8_t)(mem_address >> 8);
+    cmd[3] = (uint8_t)(mem_address & 0xff);
+    unio_inter_command_gap();
+    unio_start_header();
+    a = unio_send_n_bytes(cmd, 4, false);
+    b = unio_receive_n_bytes(buffer, length);
+    return a && b;
 }
 
-#define fail() do { __set_interrupt_state(state); return false; } while (0)
-
-bool UNIO_read(uint8_t unio_address, uint8_t *buffer,uint16_t address,uint16_t length)
+bool UNIO_start_write(uint8_t dev_address, const uint8_t* buffer, uint16_t mem_address, uint16_t length)
 {
-  uint8_t cmd[4];
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_READ;
-  cmd[2]=(uint8_t)(address>>8);
-  cmd[3]=(uint8_t)(address&0xff);
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,4,false)) fail();
-  if (!unio_read(buffer,length)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
+    bool a, b;
+    uint8_t cmd[4];
+    if (((mem_address & 0x0f) + length) > 16)
+        return false; // would cross page boundary
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_WRITE;
+    cmd[2] = (uint8_t)(mem_address >> 8);
+    cmd[3] = (uint8_t)(mem_address & 0xff);
+    unio_inter_command_gap();
+    unio_start_header();
+    a = unio_send_n_bytes(cmd, 4, false);
+    b = unio_send_n_bytes(buffer, length, true);
+    return a && b;
 }
 
-bool UNIO_start_write(uint8_t unio_address, const uint8_t *buffer,uint16_t address,uint16_t length)
+bool UNIO_enable_write(uint8_t dev_address)
 {
-  uint8_t cmd[4];
-  if (((address&0x0f)+length)>16) return false; // would cross page boundary
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_WRITE;
-  cmd[2]=(uint8_t)(address>>8);
-  cmd[3]=(uint8_t)(address&0xff);
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,4,false)) fail();
-  if (!unio_send(buffer,length,true)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
+    uint8_t cmd[2];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_WREN;
+    unio_inter_command_gap();
+    unio_start_header();
+    return unio_send_n_bytes(cmd, 2, true);
 }
 
-bool UNIO_enable_write(uint8_t unio_address)
+bool UNIO_disable_write(uint8_t dev_address)
 {
-  uint8_t cmd[2];
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_WREN;
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,2,true)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
+    uint8_t cmd[2];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_WRDI;
+    unio_inter_command_gap();
+    unio_start_header();
+    return unio_send_n_bytes(cmd, 2, true);
 }
 
-bool UNIO_disable_write(uint8_t unio_address)
+bool UNIO_read_status(uint8_t dev_address, uint8_t* status)
 {
-  uint8_t cmd[2];
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_WRDI;
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,2,true)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
+    bool a, b;
+    uint8_t cmd[2];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_RDSR;
+    unio_inter_command_gap();
+    unio_start_header();
+    a = unio_send_n_bytes(cmd, 2, false);
+    b = unio_receive_n_bytes(status, 1);
+    return a && b;
 }
 
-bool UNIO_read_status(uint8_t unio_address, uint8_t *status)
+bool UNIO_write_status(uint8_t dev_address, uint8_t status)
 {
-  uint8_t cmd[2];
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_RDSR;
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,2,false)) fail();
-  if (!unio_read(status,1)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
+    uint8_t cmd[3];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_WRSR;
+    cmd[2] = status;
+    unio_inter_command_gap();
+    unio_start_header();
+    return unio_send_n_bytes(cmd, 3, true);
 }
 
-bool UNIO_write_status(uint8_t unio_address, uint8_t status)
+bool UNIO_await_write_complete(uint8_t dev_address)
 {
-  uint8_t cmd[3];
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_WRSR;
-  cmd[2]=status;
-  unio_standby_pulse();
-  // cli();
-  unsigned short state = __get_interrupt_state();
-  __disable_interrupt();
-  unio_start_header();
-  if (!unio_send(cmd,3,true)) fail();
-  //sei();
-  __set_interrupt_state(state);
-  return true;
-}
+    bool a, b;
+    uint8_t cmd[2];
+    uint8_t status;
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_RDSR;
+    unio_inter_command_gap();
 
-bool UNIO_await_write_complete(uint8_t unio_address)
-{
-  uint8_t cmd[2];
-  uint8_t status;
-  cmd[0]=unio_address;
-  cmd[1]=UNIO_RDSR;
-  unio_standby_pulse();
-  /* Here we issue RDSR commands back-to-back until the WIP bit in the
-     status register is cleared.  Note that this isn't absolutely the
-     most efficient way to monitor this bit; after sending the command
-     we could read as many uint8_ts as we like as long as we send MAK
-     after each uint8_t.  The unio_read() function isn't set up to do
-     this, though, and it's not really performance-critical compared
-     to the eeprom write time! We re-enable interrupts briefly between
-     each command so that any background tasks like updating millis()
-     continue to happen.*/
-  do
+    /* Here we issue RDSR commands back-to-back until the WIP bit in the
+       status register is cleared.  Note that this isn't absolutely the
+       most efficient way to monitor this bit; after sending the command
+       we could read as many uint8_ts as we like as long as we send MAK
+       after each uint8_t.  The unio_read() function isn't set up to do
+       this, though, and it's not really performance-critical compared
+       to the eeprom write time! We re-enable interrupts briefly between
+       each command so that any background tasks like updating millis()
+       continue to happen.*/
+    do
     {
-      unio_inter_command_gap();
-      // cli();
-      unsigned short state = __get_interrupt_state();
-      __disable_interrupt();
-      unio_start_header();
-      if (!unio_send(cmd,2,false)) fail();
-      if (!unio_read(&status,1)) fail();
-      //sei();
-      __set_interrupt_state(state);
-    } while (status&0x01);
-  return true;
+        unio_inter_command_gap();
+        unio_start_header();
+        a = unio_send_n_bytes(cmd, 2, false);
+        b = unio_receive_n_bytes(&status, 1);
+    }
+    while (a && b && (status & UNIO_EEPROM_STATUS_WIP));
+
+    return true;
 }
 
-bool UNIO_simple_write(uint8_t unio_address, const uint8_t *buffer,uint16_t address,uint16_t length)
+bool UNIO_simple_write(uint8_t dev_address, const uint8_t* buffer, uint16_t address, uint16_t length)
 {
-  uint16_t wlen;
-  while (length>0) {
-    wlen=length;
-    if (((address&0x0f)+wlen)>16)
-      {
-        /* Write would cross a page boundary.  Truncate the write to the
-           page boundary. */
-        wlen=16-(address&0x0f);
-      }
-    if (!UNIO_enable_write(unio_address)) return false;
-    if (!UNIO_start_write(unio_address, buffer,address,wlen)) return false;
-    if (!UNIO_await_write_complete(unio_address)) return false;
-    buffer+=wlen;
-    address+=wlen;
-    length-=wlen;
-  }
-  return true;
+    uint16_t wlen;
+    while (length > 0)
+    {
+        wlen = length;
+        if (((address & 0x0f) + wlen) > 16)
+        {
+            /* Write would cross a page boundary.  Truncate the write to the
+               page boundary. */
+            wlen = 16 - (address & 0x0f);
+        }
+        if (!UNIO_enable_write(dev_address))
+            return false;
+        if (!UNIO_start_write(dev_address, buffer, address, wlen))
+            return false;
+        if (!UNIO_await_write_complete(dev_address))
+            return false;
+        buffer += wlen;
+        address += wlen;
+        length -= wlen;
+    }
+    return true;
+}
+
+
+bool UNIO_erase_all(uint8_t dev_address)
+{
+    uint8_t cmd[2];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_ERAL;
+    unio_inter_command_gap();
+    unio_start_header();
+    return unio_send_n_bytes(cmd, 2, true);
+}
+
+
+bool UNIO_set_all(uint8_t dev_address)
+{
+    uint8_t cmd[2];
+    cmd[0] = dev_address;
+    cmd[1] = UNIO_EEPROM_SETAL;
+    unio_inter_command_gap();
+    unio_start_header();
+    return unio_send_n_bytes(cmd, 2, true);
 }

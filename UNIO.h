@@ -1,5 +1,6 @@
 /* Copyright (C) 2011 by Stephen Early <steve@greenend.org.uk>
 Copyright (C) 2017 by Jeroen Lanting <https://github.com/NESFreak>
+Copyright (C) 2024 by Tom LeMense <https:github.com/tomcircuit>
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
@@ -20,34 +21,46 @@ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 
-#pragma once
+#ifndef unio_h
+#define unio_h
 
-#include <msp430.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "stm32f10x.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* !!HARDWARE SPECIFIC DEFINES - ADJUST AS NEEDED!! */
 
-/* Class to access Microchip UNI/O devices connected to any pin
-   of an mps430, such as the 11AA02E48 eeprom chip.  Multiple UNI/O
-   devices may be connected to this pin, provided they have different
-   addresses.  The 11AA161 2048-uint8_t EEPROM has address 0xa1, and so
-   may be connected along with the 11AA02E48 if the application needs
-   extra non-volatile storage space. */
+/* macros for UNIO pin maniuplation - here, B0 is assumed */
+/* assumes that GPIO is configured as Open Drain output */
+#define UNIO_LOW  do { GPIOB->BRR = GPIO_Pin_0; } while (0)
+#define UNIO_HIGH do { GPIOB->BSRR = GPIO_Pin_0; } while (0)
+#define UNIO_INP (GPIOB->IDR & GPIO_IDR_IDR0)
 
+/* macros for GPT maninpultion - here TIM3 is assumed */
+/* assumes that GPT is set for 1us/tick and One Pulse Mode */
+#define GPT_START do { TIM3->CR1 |= TIM_CR1_CEN; } while (0)
+#define GPT_STOP  do { TIM3->CR1 &= ~(TIM_CR1_CEN); } while (0)
+#define GPT_RELOAD(val) do { TIM3->ARR = (val); } while (0)
+#define GPT_UPDATE do { TIM3->EGR |= TIM_EGR_UG ; } while (0)
+#define GPT_RUNNING (TIM3->CR1 & TIM_CR1_CEN)
+#define GPT_DELAY do { __NOP(); } while (GPT_RUNNING)
+
+/* UNIO bus timing - all derived from UNIO_BIT_US */
+/* !!THIS TIMING IS NOT ACCURATE! ADJUST IF BITRATE IS CRITICAL!! */
+#define UNIO_BIT_US (32u)
+#define UNIO_HALF_BIT_US ((UNIO_BIT_US / 2u) - 1u)
+#define UNIO_QUARTER_BIT_US ((UNIO_BIT_US / 4u) - 1u)
+
+/* Functions to access Microchip UNI/O devices connected to any open-drain
+   capable GPIO pin of an STM32F103, such as the 11AA02E48 eeprom chip.
+   Multiple UNI/O devices may be connected to this pin, provided they
+   have different addresses. The 11AA161 2048-uint8_t EEPROM has address
+   0xa1, and so may be connected along with the 11AA02E48 if the
+   application needs extra non-volatile storage space. */
+#define UNIO_STARTHEADER (0x55)
 #define UNIO_EEPROM_ADDRESS (0xa0)
-#define UNIO_PXIN     (P1IN)
-#define UNIO_PXOUT    (P1OUT)
-#define UNIO_PXDIR    (P1DIR)
-#define UNIO_PXSEL    (P1SEL)
-#define UNIO_PXSEL2   (P1SEL2)
-#define UNIO_PIN      (0)
-/* The number of clocks a us takes, as timings are minima,
-   round this number up to the nearest integer.*/
-#define UNIO_USCLKS   (8)
+#define UNIO_EEPROM_STATUS_WIP (0x01)
 
 /* Microchip indicate that there may be more device types coming for
    this bus - temperature sensors, display controllers, I/O port
@@ -55,7 +68,28 @@ extern "C" {
    addresses and so can all be connected to the same pin.  Don't hold
    your breath though! */
 
-/* Configure the above defined pin, and put the UNIO bus to sleep */
+/* 11AAxxx EEPROM specific commands */
+#define UNIO_EEPROM_READ        0x03
+#define UNIO_EEPROM_CRRD        0x06
+#define UNIO_EEPROM_WRITE       0x6c
+#define UNIO_EEPROM_WREN        0x96
+#define UNIO_EEPROM_WRDI        0x91
+#define UNIO_EEPROM_RDSR        0x05
+#define UNIO_EEPROM_WRSR        0x6e
+#define UNIO_EEPROM_ERAL        0x6d
+#define UNIO_EEPROM_SETAL       0x67
+
+/* The following are defined in the datasheet as _minimum_ times, in
+   microseconds.  There is no maximum. */
+#define UNIO_TSTBY_US (600u)
+#define UNIO_TSS_US    (10u)
+#define UNIO_THDR_US    (5u)
+
+/* Additional margin to all the times defined above to ensure compliance (e.g. fast HSI) */
+#define UNIO_MARGIN_US (5u)
+
+/* Put the UNIO bus to sleep. This assumes that both TIM3 and GPIOx
+   have already been enabled and initialized */
 void UNIO_init();
 
 /* All the following calls return true for success and false for
@@ -64,7 +98,7 @@ void UNIO_init();
 /* Read from memory into the buffer, starting at 'address' in the
    device, for 'length' uint8_ts.  Note that on failure the buffer may
    still have been overwritten. */
-bool UNIO_read(uint8_t unio_address, uint8_t *buffer,uint16_t address,uint16_t length);
+bool UNIO_read(uint8_t unio_address, uint8_t* buffer, uint16_t address, uint16_t length);
 
 /* Write data to memory.  The write must not overlap a page
    boundary; pages are 16 uint8_ts long, starting at zero.  Will return
@@ -78,7 +112,7 @@ bool UNIO_read(uint8_t unio_address, uint8_t *buffer,uint16_t address,uint16_t l
    before setting the write enable bit and writing more data.  Call
    await_write_complete() if you want to block until the write is
    finished. */
-bool UNIO_start_write(uint8_t unio_address, const uint8_t *buffer,uint16_t address,uint16_t length);
+bool UNIO_start_write(uint8_t unio_address, const uint8_t* buffer, uint16_t address, uint16_t length);
 
 /* Set the write enable bit.  This must be done before EVERY write;
    the bit is cleared on a successful write. */
@@ -92,7 +126,7 @@ bool UNIO_disable_write(uint8_t unio_address);
    0x02 - write enable
    0x04 - block protect 0
    0x08 - block protect 1 */
-bool UNIO_read_status(uint8_t unio_address, uint8_t *status);
+bool UNIO_read_status(uint8_t unio_address, uint8_t* status);
 
 /* Write to the status register.  Bits are as shown above; only bits
    BP0 and BP1 may be written.  Values that may be written are:
@@ -100,12 +134,6 @@ bool UNIO_read_status(uint8_t unio_address, uint8_t *status);
    0x04 - upper quarter of device is write-protected
    0x08 - upper half of device is write-protected
    0x0c - whole device is write-protected
-
-   The MAC address chip on the Nanode is shipped with the upper quarter
-   of the device write-protected.  If you disable write-protection,
-   it is possible to overwrite the MAC address pre-programmed into the
-   device; this is stored in the last 6 uint8_ts (at address 0x00fa).
-   Be careful!
 
    The write enable bit must be set before a write to the status
    register will succeed.  The bit will be cleared on a successful
@@ -123,8 +151,12 @@ bool UNIO_await_write_complete(uint8_t unio_address);
    thereof.  Will NOT alter the write-protect bits, so will not
    write to write-protected parts of the device - although the
    return code will not indicate that this has failed. */
-bool UNIO_simple_write(uint8_t unio_address, const uint8_t *buffer, uint16_t address,uint16_t length);
+bool UNIO_simple_write(uint8_t unio_address, const uint8_t* buffer, uint16_t address, uint16_t length);
 
-#ifdef __cplusplus
-} /* extern "C" */
-#endif
+/* Bulk erase the EERPOM.  Must enable writes prior to issuing this command */
+bool UNIO_erase_all(uint8_t dev_address);
+
+/* Bulk set the EERPOM to 0xFF.  Must enable writes prior to issuing this command */
+bool UNIO_set_all(uint8_t dev_address);
+
+#endif /* #ifndef unio_h */
