@@ -8,7 +8,7 @@
 
 ## Description
 
-The main (only?) purpose for this is to allow usage of the Microchip 11AAxxx family of UNI/O EEPROM devices with an STM32F103 device. This code is largely based upon [NESFreak MSP430_UNIO](https://github.com/NESFreak/MSP430_UNIO) library. I was able to adapted towards STM32F103 with only a very few changes. Here, briefly, are the key differences from the MSP430 version:
+The main (only?) purpose for this is to allow usage of the Microchip 11AAxxx family of UNI/O EEPROM devices with an STM32F103 device. This code is largely based upon that of [NESFreak MSP430_UNIO](https://github.com/NESFreak/MSP430_UNIO). I was able to adapt towards the STM32F103 with only a very few changes. Here, briefly, are the key differences from the MSP430 version:
 
 * I chose to configure the UNI/O bus GPIO as Open Drain. This allows
 the pin to be read/written without having to change pin direction.
